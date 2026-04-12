@@ -1,10 +1,10 @@
 """
-The base/pretraining dataset is a set of parquet files.
-This file contains utilities for:
-- iterating over the parquet files and yielding documents from it
-- download the files on demand if they are not on disk
+基础/预训练数据集是一组 parquet 文件。
+本文件包含以下实用功能：
+- 遍历 parquet 文件并从中产出文档
+- 如果文件不在磁盘上，则按需下载
 
-For details of how the dataset was prepared, see `repackage_data_reference.py`.
+有关数据集准备方式的详细信息，请参见 `repackage_data_reference.py`。
 """
 
 import os
@@ -17,12 +17,12 @@ from multiprocessing import Pool
 from nanochat.common import get_base_dir
 
 # -----------------------------------------------------------------------------
-# The specifics of the current pretraining dataset
+# 当前预训练数据集的具体细节
 
-# The URL on the internet where the data is hosted and downloaded from on demand
+# 互联网上托管数据，并可按需下载该数据的 URL。
 BASE_URL = "https://huggingface.co/datasets/karpathy/climbmix-400b-shuffle/resolve/main"
-MAX_SHARD = 6542 # the last datashard is shard_06542.parquet
-index_to_filename = lambda index: f"shard_{index:05d}.parquet" # format of the filenames
+MAX_SHARD = 6542 # 最后一个数据分片是 shard_06542.parquet
+index_to_filename = lambda index: f"shard_{index:05d}.parquet" # 文件名的格式 shard_00001.parquet
 base_dir = get_base_dir()
 DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
 
@@ -84,28 +84,32 @@ def parquets_iter_batched(split, start=0, step=1):
 def download_single_file(index):
     """ Downloads a single file index, with some backoff """
 
-    # Construct the local filepath for this file and skip if it already exists
+    # 将 index 构造成 shard_{index:05d}.parquet 格式的文件路径
+    # 如果文件存在则直接跳过
     filename = index_to_filename(index)
     filepath = os.path.join(DATA_DIR, filename)
     if os.path.exists(filepath):
         print(f"Skipping {filepath} (already exists)")
         return True
 
-    # Construct the remote URL for this file
+    # 构造文件的远程 url
     url = f"{BASE_URL}/{filename}"
     print(f"Downloading {filename}...")
 
-    # Download with retries
-    max_attempts = 5
+    # 带有重试机制的下载
+    max_attempts = 5    # 最大重试次数
     for attempt in range(1, max_attempts + 1):
         try:
+            # 流式下载，适合大文件，节省内存
             response = requests.get(url, stream=True, timeout=30)
+            # 检查  HTTP 状态码，出错会抛出 requests.HTTPError 异常
             response.raise_for_status()
-            # Write to temporary file first
+            # 先写入临时文件
             temp_path = filepath + f".tmp"
-            with open(temp_path, 'wb') as f:
-                for chunk in response.iter_content(chunk_size=1024 * 1024):  # 1MB chunks
-                    if chunk:
+            with open(temp_path, 'wb') as f:    # 二进制打开
+                # 迭代响应内容，每次读取 1MB（1024*1024 字节）的块
+                for chunk in response.iter_content(chunk_size=1024 * 1024):
+                    if chunk:       # 过滤掉空的块
                         f.write(chunk)
             # Move temp file to final location
             os.rename(temp_path, filepath)
@@ -114,14 +118,14 @@ def download_single_file(index):
 
         except (requests.RequestException, IOError) as e:
             print(f"Attempt {attempt}/{max_attempts} failed for {filename}: {e}")
-            # Clean up any partial files
+            # 清理所有部分文件
             for path in [filepath + f".tmp", filepath]:
                 if os.path.exists(path):
                     try:
                         os.remove(path)
                     except:
                         pass
-            # Try a few times with exponential backoff: 2^attempt seconds
+            # 尝试几次，采用指数退避策略：2^attempt 秒
             if attempt < max_attempts:
                 wait_time = 2 ** attempt
                 print(f"Waiting {wait_time} seconds before retry...")
@@ -139,22 +143,23 @@ if __name__ == "__main__":
     parser.add_argument("-w", "--num-workers", type=int, default=4, help="Number of parallel download workers (default: 4)")
     args = parser.parse_args()
 
-    # Prepare the output directory
+    # 创建 output 目录，DATA_DIR 默认为 `~/.cache/nanochat/base_data_climbmix`
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    # The way this works is that the user specifies the number of train shards to download via the -n flag.
-    # In addition to that, the validation shard is *always* downloaded and is pinned to be the last shard.
+    # 其工作原理是：用户通过 `-n` 标志指定要下载的训练分片数量。 
+    # 此外，验证分片 *总是* 会被下载，并被固定为最后一个分片。
     num_train_shards = MAX_SHARD if args.num_files == -1 else min(args.num_files, MAX_SHARD)
     ids_to_download = list(range(num_train_shards))
-    ids_to_download.append(MAX_SHARD) # always download the validation shard
+    ids_to_download.append(MAX_SHARD)
 
-    # Download the shards
+    # 下载
     print(f"Downloading {len(ids_to_download)} shards using {args.num_workers} workers...")
     print(f"Target directory: {DATA_DIR}")
     print()
+    # 创建进程池（默认 4 进程）按照 ids_to_download 列表调用 download_single_file 下载
     with Pool(processes=args.num_workers) as pool:
         results = pool.map(download_single_file, ids_to_download)
 
-    # Report results
+    # 记录结果
     successful = sum(1 for success in results if success)
     print(f"Done! Downloaded: {successful}/{len(ids_to_download)} shards to {DATA_DIR}")

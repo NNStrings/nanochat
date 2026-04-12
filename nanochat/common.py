@@ -68,7 +68,9 @@ setup_default_logging()
 logger = logging.getLogger(__name__)
 
 def get_base_dir():
-    # co-locate nanochat intermediates with other cached data in ~/.cache (by default)
+    """
+    创建（若不存在）并获取 base 目录，目录默认为: `~/.cache/nanochat`
+    """
     if os.environ.get("NANOCHAT_BASE_DIR"):
         nanochat_dir = os.environ.get("NANOCHAT_BASE_DIR")
     else:
