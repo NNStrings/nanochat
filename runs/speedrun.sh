@@ -58,7 +58,7 @@ python -m nanochat.dataset -n 8
 # 整个数据集中可用的最大分片总数为 6542。
 # 节省资源，暂时不需要
 # python -m nanochat.dataset -n 170 &
-DATASET_DOWNLOAD_PID=$!
+# DATASET_DOWNLOAD_PID=$!
 # 在约 20 亿字符数据上训练 tokenizer，词汇表大小为 2**15 = 32768
 python -m scripts.tok_train
 # 评估 tokenizer（报告压缩比等）
@@ -66,8 +66,8 @@ python -m scripts.tok_eval
 
 # -----------------------------------------------------------------------------
 # 基座模型（预训练）
-echo "Waiting for dataset download to complete..."
-wait $DATASET_DOWNLOAD_PID
+# echo "Waiting for dataset download to complete..."
+# wait $DATASET_DOWNLOAD_PID
 
 # # d24 模型（略微欠训练以击败 GPT-2 => 将数据:参数比从计算最优值 10.5（默认）降低到 8）
 # torchrun --standalone --nproc_per_node=8 -m scripts.base_train -- --depth=24 --target-param-data-ratio=8 --device-batch-size=16 --fp8 --run=$WANDB_RUN

@@ -10,23 +10,29 @@ import os
 import copy
 from functools import lru_cache
 
+# 这些特殊 token 常用于用户对话式的 ai，没有这些标记，模型看到的只是一堆连续的文本，
+# 分不清哪段是用户说的、哪段是助手要回答的、哪段是代码。就像一篇文章没有标点符号和段落
+# 
+# <|bos|>: 相当于正文开始。用在每个文档或一段独立文本的开头，让模型知道这是一个新的输入
+# <|user_start|>/<|user_end|>: 包裹用户说的话，让模型分清这是用户的问题
+# <|assistant_start|>/<|assistant_end|>: 包裹助手 AI 的回答。模型在训练时会看到这种模式，从而学会在生成回答时也用这种格式
+# <|python_start|>/<|python_end|>: 当助手想运行 Python 代码时，把代码放在这两个标记之间。模型就知道这里不是普通文字，是要交给 Python 解释器执行的代码
+# <|output_start|>/<|output_end|>: 用来包裹代码运行后输出的结果。比如计算 1+1，输出 2 就会被放在这两个标记之间，再送回给模型看
 SPECIAL_TOKENS = [
-    # every document begins with the Beginning of Sequence (BOS) token that delimits documents
     "<|bos|>",
-    # tokens below are only used during finetuning to render Conversations into token ids
-    "<|user_start|>", # user messages
+    "<|user_start|>",
     "<|user_end|>",
-    "<|assistant_start|>", # assistant messages
+    "<|assistant_start|>",
     "<|assistant_end|>",
-    "<|python_start|>", # assistant invokes python REPL tool
+    "<|python_start|>",
     "<|python_end|>",
-    "<|output_start|>", # python REPL outputs back to assistant
+    "<|output_start|>",
     "<|output_end|>",
 ]
 
-# NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
-# I did this because I didn't want to "waste" too many tokens on numbers for smaller vocab sizes.
-# I verified that 2 is the sweet spot for vocab size of 32K. 1 is a bit worse, 3 was worse still.
+# NOTE: 此分割模式与 GPT-4 的不同之处在于，我们使用 \p{N}{1,2} 而不是 \p{N}{1,3}
+# 这样做是因为对于较小的词汇表大小，我不想在数字上浪费太多标记。
+# 我验证过，对于 32K 的词汇表大小，2 是最佳选择。1 稍差一些，3 则更差。
 SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
 # -----------------------------------------------------------------------------
@@ -169,18 +175,29 @@ class RustBPETokenizer:
 
     @classmethod
     def train_from_iterator(cls, text_iterator, vocab_size):
-        # 1) train using rustbpe
+        """通过一个文本迭代器训练分词器
+        Args:
+            text_iterator: 文本迭代器
+            vocab_size: 词表大小
+        """
+        # 1) 使用 rustbpe 训练（rustbpe 是一个轻量级的训练库，专门用于训练 GPT 风格的 BPE 分词器）
         tokenizer = rustbpe.Tokenizer()
-        # the special tokens are inserted later in __init__, we don't train them here
+        # 特殊 tokens 之后在 __init__ 添加，在这我们不训练它
         vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
         assert vocab_size_no_special >= 256, f"vocab_size_no_special must be at least 256, got {vocab_size_no_special}"
+        # 进行训练
         tokenizer.train_from_iterator(text_iterator, vocab_size_no_special, pattern=SPLIT_PATTERN)
-        # 2) construct the associated tiktoken encoding for inference
+        # 2) 构建用于推理的相关 tiktoken 编码
+        # 获取分词器匹配模式（默认是 GPT 分词器，如果 train_from_iterator 传入 pattern 则为 pattern 的值）
         pattern = tokenizer.get_pattern()
+        # 获取 BPE 合并规则，类型为 list[tuple]，rust 中为 Vec<(Vec<u8>, u32)>
         mergeable_ranks_list = tokenizer.get_mergeable_ranks()
+        # 转换成字典，类型为 dict[bytes, int]
         mergeable_ranks = {bytes(k): v for k, v in mergeable_ranks_list}
         tokens_offset = len(mergeable_ranks)
+        # 特殊字符 token
         special_tokens = {name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)}
+        # 生成编码器（tiktoken 是一个纯推理库，专注于 OpenAI 的 BPE 分词算法）
         enc = tiktoken.Encoding(
             name="rustbpe",
             pat_str=pattern,
@@ -207,6 +224,8 @@ class RustBPETokenizer:
         return cls(enc, "<|endoftext|>")
 
     def get_vocab_size(self):
+        """获取词表大小
+        """
         return self.enc.n_vocab
 
     def get_special_tokens(self):

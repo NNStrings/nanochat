@@ -27,14 +27,14 @@ base_dir = get_base_dir()
 DATA_DIR = os.path.join(base_dir, "base_data_climbmix")
 
 # -----------------------------------------------------------------------------
-# These functions are useful utilities to other modules, can/should be imported
+# 这些函数对其他模块是有用的工具，需要被引入
 
 def list_parquet_files(data_dir=None, warn_on_legacy=False):
-    """ Looks into a data dir and returns full paths to all parquet files. """
+    """检查数据目录，并返回所有 Parquet 文件的完整路径。"""
     data_dir = DATA_DIR if data_dir is None else data_dir
 
-    # Legacy-supporting code due to the upgrade from FinewebEdu-100B to ClimbMix-400B
-    # This code will eventually be deleted.
+    # 为兼容从 FinewebEdu-100B 升级至 ClimbMix-400B 而保留的旧版兼容代码
+    # 此代码最终将被移除。
     if not os.path.exists(data_dir):
         if warn_on_legacy:
             print()
@@ -54,28 +54,33 @@ def list_parquet_files(data_dir=None, warn_on_legacy=False):
             print("  For now, falling back to your old FinewebEdu-100B dataset...")
             print("=" * 80)
             print()
-        # attempt a fallback to the legacy data directory
+
         data_dir = os.path.join(base_dir, "base_data")
 
+    # 获取 data_dir 下所有 .parquet 文件并排序
     parquet_files = sorted([
         f for f in os.listdir(data_dir)
         if f.endswith('.parquet') and not f.endswith('.tmp')
     ])
+    # 补充成完整路径
     parquet_paths = [os.path.join(data_dir, f) for f in parquet_files]
     return parquet_paths
 
 def parquets_iter_batched(split, start=0, step=1):
     """
-    Iterate through the dataset, in batches of underlying row_groups for efficiency.
-    - split can be "train" or "val". the last parquet file will be val.
-    - start/step are useful for skipping rows in DDP. e.g. start=rank, step=world_size
+    以 parquet 底层的 row_group 为批次迭代数据集，以提高效率。
+    - split 参数可取值为 "train" 或 "val"；其中，最后一个 Parquet 文件将被视为验证集（val）。
+    - start 和 step 参数有助于在 DDP（分布式数据并行）模式下跳过行数据。例如：start=rank, step=world_size。
     """
     assert split in ["train", "val"], "split must be 'train' or 'val'"
     parquet_paths = list_parquet_files()
+    # 前面的用作训练集，后面的用作验证集
     parquet_paths = parquet_paths[:-1] if split == "train" else parquet_paths[-1:]
     for filepath in parquet_paths:
+        # pyarrow 用于高效读写 parquet、处理列式数据
         pf = pq.ParquetFile(filepath)
         for rg_idx in range(start, pf.num_row_groups, step):
+            # 每次只迭代一个 row_group，将数据中 text 列表转换成 python list 返回
             rg = pf.read_row_group(rg_idx)
             texts = rg.column('text').to_pylist()
             yield texts
