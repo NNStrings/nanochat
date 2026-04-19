@@ -117,6 +117,8 @@ def download_file_with_lock(url, filename, postprocess_fn=None):
     return file_path
 
 def print0(s="",**kwargs):
+    """分布式训练（DDP）场景下的日志输出控制，只执行打印主进程"""
+    # 获取环境变量 RANK 的值，如果不存在则返回默认值 0
     ddp_rank = int(os.environ.get('RANK', 0))
     if ddp_rank == 0:
         print(s, **kwargs)

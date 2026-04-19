@@ -1,14 +1,20 @@
 """
-Train model. From root directory of the project, run as:
+训练模型。从项目的根目录运行，命令如下：
 
 python -m scripts.base_train
 
-or distributed as:
+或分布式运行：
 
 torchrun --nproc_per_node=8 -m scripts.base_train
 
-If you are only on CPU/Macbook, you'll want to train a much much smaller LLM. Example:
-python -m scripts.base_train --depth=4 --max-seq-len=512 --device-batch-size=1 --eval-tokens=512 --core-metric-every=-1 --total-batch-size=512 --num-iterations=20
+如果只在 CPU/Macbook 上运行，你可能需要训练一个非常小的 LLM。示例：
+python -m scripts.base_train \
+    --depth=4 --max-seq-len=512 \
+    --device-batch-size=1 \
+    --eval-tokens=512 \
+    --core-metric-every=-1 \
+    --total-batch-size=512 \
+    --num-iterations=20
 """
 
 import os
@@ -37,56 +43,62 @@ from scripts.base_eval import evaluate_core
 print_banner()
 
 # -----------------------------------------------------------------------------
-# CLI arguments
-parser = argparse.ArgumentParser(description="Pretrain base model")
-# Logging
-parser.add_argument("--run", type=str, default="dummy", help="wandb run name ('dummy' disables wandb logging)")
-# Runtime
-parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
-# FP8 training
-parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
-parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
-# Model architecture
-parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
+# CLI 参数
+parser = argparse.ArgumentParser(description="预训练基础模型")
+# 日志记录
+parser.add_argument("--run", type=str, default="dummy", help="wandb 运行名称（'dummy' 禁用 wandb 日志记录）")
+# 运行时
+parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps（为空则自动检测）")
+# FP8 训练
+parser.add_argument("--fp8", action="store_true", help="启用 FP8 训练（需要 H100+ GPU 和 torchao）")
+parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 缩放策略：tensorwise（更快，推荐）或 rowwise（更准确但更慢）")
+# 模型架构
+parser.add_argument("--depth", type=int, default=20, help="Transformer 模型的深度")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
-parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
-parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
-parser.add_argument("--window-pattern", type=str, default="SSSL", help="sliding window pattern tiled across layers: L=full, S=half context (e.g. 'SSL')")
-# Training horizon (only one used, in order of precedence)
-parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
-parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
-parser.add_argument("--target-param-data-ratio", type=float, default=12, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
-# Optimization
-parser.add_argument("--device-batch-size", type=int, default=32, help="per-device batch size. good number to reduce to 16,8,4,... if you OOM on VRAM.")
-parser.add_argument("--total-batch-size", type=int, default=-1, help="total batch size in tokens. decent numbers are e.g. 524288. (-1 = auto-compute optimal)")
-parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
-parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
-parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
-parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
-parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
-parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
-parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
-parser.add_argument("--resume-from-step", type=int, default=-1, help="resume training from this step (-1 = disable)")
-# Evaluation
-parser.add_argument("--eval-every", type=int, default=250, help="evaluate val bpb every N steps (-1 = disable)")
-parser.add_argument("--eval-tokens", type=int, default=80*524288, help="number of tokens to evaluate val loss on")
-parser.add_argument("--core-metric-every", type=int, default=2000, help="evaluate CORE metric every N steps (-1 = disable)")
-parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="examples per task for CORE metric")
-parser.add_argument("--sample-every", type=int, default=2000, help="sample from model every N steps (-1 = disable)")
-parser.add_argument("--save-every", type=int, default=-1, help="save checkpoints every N steps (-1 = only at end)")
-# Output
-parser.add_argument("--model-tag", type=str, default=None, help="override model tag for checkpoint directory name")
+parser.add_argument("--head-dim", type=int, default=128, help="注意力机制的目标头维度")
+parser.add_argument("--max-seq-len", type=int, default=2048, help="最大上下文长度")
+parser.add_argument("--window-pattern", type=str, default="SSSL", help="滑动窗口模式，在各层上平铺：L=全局注意力，S=半上下文窗口（例如 'SSL'）")
+# 训练范围（仅使用一个，按优先级顺序）
+parser.add_argument("--num-iterations", type=int, default=-1, help="显式指定优化步数（-1 = 禁用）")
+parser.add_argument("--target-flops", type=float, default=-1.0, help="计算达到 target_flops 所需的 num_iterations（-1 = 禁用）")
+parser.add_argument("--target-param-data-ratio", type=float, default=12, help="计算维持 data:param 比例所需的 num_iterations（Chinchilla=20，-1 = 禁用）")
+# 优化
+parser.add_argument("--device-batch-size", type=int, default=32, help="每设备的 batch 大小。如果显存不足（OOM），可降为 16、8、4...")
+parser.add_argument("--total-batch-size", type=int, default=-1, help="总 batch 大小（以 token 计）。合适的数值例如 524288。（-1 = 自动计算最优值）")
+parser.add_argument("--embedding-lr", type=float, default=0.3, help="embedding 参数的学习率（Adam）")
+parser.add_argument("--unembedding-lr", type=float, default=0.008, help="unembedding 参数的学习率（Adam）")
+parser.add_argument("--weight-decay", type=float, default=0.28, help="Muon 优化器（用于权重）的谨慎权重衰减")
+parser.add_argument("--matrix-lr", type=float, default=0.02, help="矩阵参数的学习率（Muon）")
+parser.add_argument("--scalar-lr", type=float, default=0.5, help="标量参数（resid_lambdas, x0_lambdas）的学习率")
+parser.add_argument("--warmup-steps", type=int, default=40, help="学习率预热的步数")
+parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="学习率衰减阶段占迭代次数的比例")
+parser.add_argument("--final-lr-frac", type=float, default=0.05, help="最终学习率占初始学习率的比例")
+parser.add_argument("--resume-from-step", type=int, default=-1, help="从指定步数恢复训练（-1 = 禁用）")
+# 评估
+parser.add_argument("--eval-every", type=int, default=250, help="每 N 步评估验证集的 bpb（-1 = 禁用）")
+parser.add_argument("--eval-tokens", type=int, default=80*524288, help="用于评估验证集损失的 token 数量")
+parser.add_argument("--core-metric-every", type=int, default=2000, help="每 N 步评估 CORE 指标（-1 = 禁用）")
+parser.add_argument("--core-metric-max-per-task", type=int, default=500, help="CORE 指标中每个任务的最大样本数")
+parser.add_argument("--sample-every", type=int, default=2000, help="每 N 步从模型中进行采样（-1 = 禁用）")
+parser.add_argument("--save-every", type=int, default=-1, help="每 N 步保存检查点（-1 = 仅在结束时保存）")
+# 输出
+parser.add_argument("--model-tag", type=str, default=None, help="覆盖用于检查点目录名称的 model tag")
 args = parser.parse_args()
-user_config = vars(args).copy()  # for logging
+# 日志记录参数信息
+user_config = vars(args).copy()
 # -----------------------------------------------------------------------------
-# Compute init and wandb logging
+# 计算初始化和 wandb 日志
 
+# 设备类型
 device_type = autodetect_device_type() if args.device_type == "" else args.device_type
+# 分布式初始化与设备对象
 ddp, ddp_rank, ddp_local_rank, ddp_world_size, device = compute_init(device_type)
-master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+# 只有 rank 0 的进程（主进程）负责输出日志、保存 checkpoint、与 wandb 交互等，避免多进程重复操作
+master_process = ddp_rank == 0
+# 同步函数与显存监控（CUDA 专用）
 synchronize = torch.cuda.synchronize if device_type == "cuda" else lambda: None
 get_max_memory = torch.cuda.max_memory_allocated if device_type == "cuda" else lambda: 0
+# GPU 性能信息获取
 if device_type == "cuda":
     gpu_device_name = torch.cuda.get_device_name(0)
     gpu_peak_flops = get_peak_flops(gpu_device_name)
@@ -95,11 +107,11 @@ else:
     gpu_peak_flops = float('inf')  # MFU not meaningful for CPU/MPS
 print0(f"COMPUTE_DTYPE: {COMPUTE_DTYPE} ({COMPUTE_DTYPE_REASON})")
 
-# wandb logging init
+# wandb 日志初始化
 use_dummy_wandb = args.run == "dummy" or not master_process
 wandb_run = DummyWandb() if use_dummy_wandb else wandb.init(project="nanochat", name=args.run, config=user_config)
 
-# Flash Attention status
+# 获取 Flash Attention 状态，检查 Flash Attention 3 是否可用
 from nanochat.flash_attention import USE_FA3
 using_fa3 = USE_FA3
 if using_fa3:
@@ -117,7 +129,7 @@ else:
     print0("!" * 80)
 
 # -----------------------------------------------------------------------------
-# Tokenizer will be useful for evaluation and also we need the vocab size to init the model
+# 分词器对评估很有用，而且我们需要词汇表大小来初始化模型
 tokenizer = get_tokenizer()
 token_bytes = get_token_bytes(device=device)
 vocab_size = tokenizer.get_vocab_size()
