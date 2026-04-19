@@ -407,6 +407,7 @@ class RustBPETokenizer:
 # nanochat-specific convenience functions
 
 def get_tokenizer():
+    """从默认的路径下获取训练的 tokenizer"""
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()
     tokenizer_dir = os.path.join(base_dir, "tokenizer")
@@ -414,6 +415,7 @@ def get_tokenizer():
     return RustBPETokenizer.from_directory(tokenizer_dir)
 
 def get_token_bytes(device="cpu"):
+    """获取 token_bytes.pt（记录了每个 token 的字符数）"""
     import torch
     from nanochat.common import get_base_dir
     base_dir = get_base_dir()

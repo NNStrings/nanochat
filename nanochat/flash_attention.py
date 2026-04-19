@@ -21,7 +21,7 @@ import torch.nn.functional as F
 # Detection: Try to load FA3 on Hopper+ GPUs
 # =============================================================================
 def _load_flash_attention_3():
-    """Try to load Flash Attention 3 (requires Hopper GPU, sm90)."""
+    """尝试加载 Flash Attention 3 (需要 Hopper GPU, sm90)."""
     if not torch.cuda.is_available():
         return None
     try:
@@ -46,7 +46,7 @@ _override_impl = None
 
 
 def _resolve_use_fa3():
-    """Decide once whether to use FA3, based on availability, override, and dtype."""
+    """根据可用性、覆盖设置和数据类型决定设备是否使用 FA3"""
     if _override_impl == 'fa3':
         assert HAS_FA3, "Cannot override to FA3: not available on this hardware"
         return True
