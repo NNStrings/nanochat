@@ -102,30 +102,30 @@ def _sdpa_attention(q, k, v, window_size, enable_gqa):
     return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, enable_gqa=enable_gqa)
 
 # =============================================================================
-# Public API: Same interface as FA3
+# 公共 API：与 FA3 接口相同
 # =============================================================================
 def flash_attn_func(q, k, v, causal=False, window_size=(-1, -1)):
     """
-    Flash Attention for training (no KV cache).
+    用于训练的 Flash Attention（无 KV 缓存）。
 
     Args:
-        q, k, v: Tensors of shape (B, T, H, D)
-        causal: Whether to use causal masking
-        window_size: (left, right) sliding window. -1 means unlimited.
+        q, k, v: 形状为 (B, T, H, D) 的张量
+        causal: 是否使用因果掩码
+        window_size: (left, right) 滑动窗口。 -1 表示无限制
 
     Returns:
-        Output tensor of shape (B, T, H, D)
+        形状为 (B, T, H, D) 的输出张量
     """
     if USE_FA3:
         return _fa3.flash_attn_func(q, k, v, causal=causal, window_size=window_size)
 
-    # SDPA fallback: transpose (B, T, H, D) -> (B, H, T, D)
+     # SDPA 回退：转置 (B, T, H, D) -> (B, H, T, D)
     q = q.transpose(1, 2)
     k = k.transpose(1, 2)
     v = v.transpose(1, 2)
     enable_gqa = q.size(1) != k.size(1)
     y = _sdpa_attention(q, k, v, window_size, enable_gqa)
-    return y.transpose(1, 2)  # back to (B, T, H, D)
+    return y.transpose(1, 2)  # 回到 (B, T, H, D)
 
 
 def flash_attn_with_kvcache(q, k_cache, v_cache, k=None, v=None, cache_seqlens=None,
