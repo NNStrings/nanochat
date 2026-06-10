@@ -40,18 +40,40 @@ def _patch_missing_keys(model_data, model_config):
         log0(f"Patching missing x0_lambdas in model data to 0.0")
 
 def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data, rank=0):
+    """
+    保存检查点
+
+    Args:
+        checkpoint_dir:
+            保存检查点的目录
+        
+        step:
+            当前训练的步数
+        
+        model_data:
+            模型数据，model.state_dict()
+
+        optimizer_data:
+            优化器数据，optimizer.state_dict()
+        
+        meta_data:
+            元数据，包含很多参数，传入一个字典格式，保存成json文件
+        
+        rank:
+            当前进程的编号
+    """
     if rank == 0:
         os.makedirs(checkpoint_dir, exist_ok=True)
-        # Save the model state parameters
+        # 保存模型参数
         model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
         torch.save(model_data, model_path)
         logger.info(f"Saved model parameters to: {model_path}")
-        # Save the metadata dict as json
+        # 保存元数据为 JSON
         meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
         with open(meta_path, "w", encoding="utf-8") as f:
             json.dump(meta_data, f, indent=2)
         logger.info(f"Saved metadata to: {meta_path}")
-    # Note that optimizer state is sharded across ranks, so each rank must save its own.
+    # NOTE: 优化器在各 rank 分片，所以每个 rank 都要保存自己的
     if optimizer_data is not None:
         os.makedirs(checkpoint_dir, exist_ok=True)
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
@@ -59,15 +81,37 @@ def save_checkpoint(checkpoint_dir, step, model_data, optimizer_data, meta_data,
         logger.info(f"Saved optimizer state to: {optimizer_path}")
 
 def load_checkpoint(checkpoint_dir, step, device, load_optimizer=False, rank=0):
-    # Load the model state
+    """
+    加载检查点
+
+    Args:
+        checkpoint_dir:
+            保存检查点的目录
+
+        step:
+            要恢复的训练步数
+
+        device:
+            将所有权重张量映射到的设备 (cpu/cuda:0 ...)
+
+        load_optimizer:
+            是否加载优化器状态
+
+        rank:
+            当前进程的编号
+        
+    Returns:
+        模型数据，优化器数据，元数据
+    """
+    # 加载模型状态
     model_path = os.path.join(checkpoint_dir, f"model_{step:06d}.pt")
     model_data = torch.load(model_path, map_location=device)
-    # Load the optimizer state if requested
+    # 如果需要，加载优化器状态
     optimizer_data = None
     if load_optimizer:
         optimizer_path = os.path.join(checkpoint_dir, f"optim_{step:06d}_rank{rank:d}.pt")
         optimizer_data = torch.load(optimizer_path, map_location=device)
-    # Load the metadata
+    # 加载元数据
     meta_path = os.path.join(checkpoint_dir, f"meta_{step:06d}.json")
     with open(meta_path, "r", encoding="utf-8") as f:
         meta_data = json.load(f)
