@@ -136,12 +136,12 @@ vocab_size = tokenizer.get_vocab_size()
 print0(f"Vocab size: {vocab_size:,}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Model
+# 初始化模型
 
 def build_model_meta(depth):
-    """Build a model on meta device for a given depth (shapes/dtypes only, no data)."""
-    # Model dim is nudged up to nearest multiple of head_dim for clean division
-    # (FA3 requires head_dim divisible by 8, and this guarantees head_dim == args.head_dim exactly)
+    """在 meta 设备上为给定的深度构建模型（仅形状/数据类型，无数据）"""
+    # 模型维度向上取整到 head_dim 的最近倍数，以便整齐划分
+    # （FA3 要求 head_dim 能被 8 整除，这保证了 head_dim == args.head_dim 精确匹配）
     base_dim = depth * args.aspect_ratio
     model_dim = ((base_dim + args.head_dim - 1) // args.head_dim) * args.head_dim
     num_heads = model_dim // args.head_dim
@@ -150,19 +150,22 @@ def build_model_meta(depth):
         n_layer=depth, n_head=num_heads, n_kv_head=num_heads, n_embd=model_dim,
         window_pattern=args.window_pattern,
     )
+    # 在 meta 上下文中创建：不分配任何内存
+    # 只保留元数据：张量对象仅记录形状、数据类型、设备类型等必要信息，数据缓冲区为 None
+    # 可以正常进行模型前向的形状计算，验证模型结构是否正确
     with torch.device("meta"):
         model_meta = GPT(config)
     return model_meta
 
-# Build the model, move to device, init the weights
-model = build_model_meta(args.depth) # 1) Build on meta device (only shapes/dtypes, no data)
+# 构建模型，移动到设备上，初始化权重
+model = build_model_meta(args.depth) # 1) 在元设备上构建（仅形状/数据类型，无数据）
 model_config = model.config
 model_config_kwargs = asdict(model_config)
 print0(f"Model config:\n{json.dumps(model_config_kwargs, indent=2)}")
-model.to_empty(device=device) # 2) All tensors get storage on target device but with uninitialized (garbage) data
-model.init_weights() # 3) All tensors get initialized
+model.to_empty(device=device) # 2) 所有张量在目标设备上获得存储空间，但包含未初始化（垃圾）数据
+model.init_weights() # 3) 所有张量被初始化
 
-# If we are resuming, overwrite the model parameters with those of the checkpoint
+# 如果要恢复运行，则使用检查点的参数覆盖模型参数
 base_dir = get_base_dir()
 output_dirname = args.model_tag if args.model_tag else f"d{args.depth}" # e.g. d12
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", output_dirname)
@@ -171,22 +174,22 @@ if resuming:
     print0(f"Resuming optimization from step {args.resume_from_step}")
     model_data, optimizer_data, meta_data = load_checkpoint(checkpoint_dir, args.resume_from_step, device, load_optimizer=True, rank=ddp_rank)
     model.load_state_dict(model_data, strict=True, assign=True)
-    del model_data # free up this memory after the copy
+    del model_data # 复制完成后释放这部分内存
 
 # -----------------------------------------------------------------------------
-# FP8 training initialization and management (this has to be done before torch.compile)
+# FP8 训练初始化和管理（这必须在 torch.compile 之前完成）
 
-# Convert Linear layers to Float8Linear if --fp8 is set
+# 如果设置了 --fp8，将 Linear 层转换为 Float8Linear
 if args.fp8:
     if device_type != "cuda":
         print0("Warning: FP8 training requires CUDA, ignoring --fp8 flag")
     else:
-        # our custom fp8 is simpler than torchao, written for exact API compatibility
+        # 我们自定义的 fp8 比 torchao 更简单，为精确的 API 兼容性而编写
         from nanochat.fp8 import Float8LinearConfig, convert_to_float8_training
         # from torchao.float8 import Float8LinearConfig, convert_to_float8_training
         import torch.nn as nn
 
-        # Filter: dims must be divisible by 16 (FP8 hardware requirement) large enough
+        # 过滤条件：维度必须能被 16 整除（FP8 硬件要求）且足够大
         def fp8_module_filter(mod: nn.Module, fqn: str) -> bool:
             if not isinstance(mod, nn.Linear):
                 return False
@@ -252,15 +255,16 @@ def disable_fp8(model):
             setattr(parent, attr_name, fp8_module)
 
 # -----------------------------------------------------------------------------
-# Compile the model
+# 编译模型
 
-orig_model = model # original, uncompiled model, for saving raw model state_dict and for inference/evaluation (because the shapes may change shape)
-model = torch.compile(model, dynamic=False) # the inputs to model will never change shape so dynamic=False is safe
+orig_model = model # 原始未编译的模型，用于保存原始模型 state_dict 以及推理/评估（因为形状可能会变化）
+# 将模型编译为更高效的中间表示，从而加速模型的前向传播和反向传播
+model = torch.compile(model, dynamic=False) # 模型的输入形状永远不会改变，因此 dynamic=False 是安全的
 
 # -----------------------------------------------------------------------------
-# Scaling laws and muP extrapolations to determine the optimal training horizon, batch size, learning rates, weight decay.
+# 缩放法则和 muP 外推，用于确定最优训练范围、批次大小、学习率、权重衰减
 
-# Get the parameter counts of our model
+# 获取我们模型的参数数量
 param_counts = model.num_scaling_params()
 print0(f"Parameter counts:")
 for key, value in param_counts.items():
@@ -269,107 +273,115 @@ num_params = param_counts['total']
 num_flops_per_token = model.estimate_flops()
 print0(f"Estimated FLOPs per token: {num_flops_per_token:e}")
 
-# 1) Use scaling laws to determine the optimal training horizon in tokens
-# The compute-optimal models satisfy the Tokens:Params ratio of --target-param-data-ratio (derived experimentally via scaling laws analysis).
-# We've already initialized the model so we have Params. Optimal Tokens is now simply target-param-data-ratio * Params
+# 1) 使用缩放法则确定最优的训练范围（以 token 数计）
+# 计算最优模型满足 --target-param-data-ratio 所定义的 Token:参数 比例（通过缩放法则分析实验得出）
+# 我们已经初始化了模型，因此已知参数数量。最优 token 数现在就是 target-param-data-ratio * 参数数量
 def get_scaling_params(m):
-    # As for which params to use exactly, transformer matrices + lm_head gives cleanest scaling laws (see dev/LOG.md Jan 27, 2026)
+    # 至于具体使用哪些参数，transformer 矩阵 + lm_head 给出最清晰的缩放法则（参见 dev/LOG.md 2026年1月27日）
     params_counts = m.num_scaling_params()
     scaling_params = params_counts['transformer_matrices'] + params_counts['lm_head']
     return scaling_params
 num_scaling_params = get_scaling_params(model)
-target_tokens = int(args.target_param_data_ratio * num_scaling_params) # optimal tokens for the model we are about to train
+target_tokens = int(args.target_param_data_ratio * num_scaling_params) # 即将训练的模型的最优 token 数
 
-# Our reference model is d12, this is where a lot of hyperparameters are tuned and then transfered to higher depths (muP style)
-d12_ref = build_model_meta(12) # creates the model on meta device
-D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # compute-optimal d12 training horizon in tokens (measured empirically)
-B_REF = 2**19 # optimal batch size at d12 ~= 524,288 tokens (measured empirically)
+# 我们的参考模型是 d12，大量超参数在此调优，然后迁移到更高深度（muP 风格）
+d12_ref = build_model_meta(12) # 在元设备上创建模型
+D_REF = args.target_param_data_ratio * get_scaling_params(d12_ref) # d12 的计算最优训练范围（以 token 数计，经验测量得出）
+B_REF = 2**19 # d12 的最优批次大小约等于 524,288 个 token（经验测量得出）
 
-# 2) Now that we have the token horizon, we can calculate the optimal batch size
-# We follow the Power Lines paper (Bopt ∝ D^0.383), ref: https://arxiv.org/abs/2505.13738
-# The optimal batch size grows as approximately D^0.383, so e.g. if D doubles from d12 to d24, B should grow by 2^0.383 ≈ 1.3x.
-total_batch_size = args.total_batch_size # user-provided override is possible
+# 2) 现在有了 token 训练范围，我们可以计算最优批次大小
+# 遵循 Power Lines 论文（Bopt ∝ D^0.383），参考文献：https://arxiv.org/abs/2505.13738
+# 最优批次大小大约按 D^0.383 增长，例如如果 D 从 d12 翻倍到 d24，B 应增长约 2^0.383 ≈ 1.3 倍。
+total_batch_size = args.total_batch_size # 用户提供的覆盖值是可能的
 if total_batch_size == -1:
     batch_size_ratio = target_tokens / D_REF
     predicted_batch_size = B_REF * batch_size_ratio ** 0.383
-    total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # clamp to nearest power of 2 for efficiency
+    total_batch_size = 2 ** round(math.log2(predicted_batch_size)) # 为效率取整到最近的 2 的幂
     print0(f"Auto-computed optimal batch size: {total_batch_size:,} tokens")
 
-# 3) Knowing the batch size, we can now calculate a learning rate correction (bigger batch size allows higher learning rates)
+# 3) 知道批次大小后，我们现在可以计算学习率修正（更大的批次大小允许更高的学习率）
 batch_lr_scale = 1.0
 batch_ratio = total_batch_size / B_REF # B/B_ref
 if batch_ratio != 1.0:
-    # SGD: linear scaling with batch size is standard (not used in nanochat)
-    # AdamW: sqrt scaling is standard: η ∝ √(B/B_ref)
-    # Muon: we will use the same scaling for Muon as for AdamW: η ∝ √(B/B_ref) (not studied carefully, assumption!)
+    # SGD：批次大小的线性缩放是标准做法（nanochat 中未使用）
+    # AdamW：平方根缩放是标准做法：η ∝ √(B/B_ref)
+    # Muon：我们将对 Muon 使用与 AdamW 相同的缩放：η ∝ √(B/B_ref)（未仔细研究，假设！）
     batch_lr_scale = batch_ratio ** 0.5 # η ∝ √(B/B_ref)
     print0(f"Scaling LRs by {batch_lr_scale:.4f} for batch size {total_batch_size:,} (reference: {B_REF:,})")
 
-# 4) Knowing the batch size and the token horizon, we can now calculate the appropriate weight decay scaling
-# We adopt the T_epoch framework from https://arxiv.org/abs/2405.13698
-# Central idea of the paper is that T_epoch = B/(η·λ·D) should remain constant.
-# Above, we used learning rate scaling η ∝ √(B/B_ref). So it's a matter of ~10 lines of math to derive that to keep T_epoch constant, we need:
+# 4) 知道批次大小和 token 训练范围后，我们现在可以计算合适的权重衰减缩放
+# 我们采用来自 https://arxiv.org/abs/2405.13698 的 T_epoch 框架
+# 论文的核心思想是 T_epoch = B/(η·λ·D) 应保持恒定。
+# 上面我们使用了学习率缩放 η ∝ √(B/B_ref)。因此通过大约 10 行数学推导，要保持 T_epoch 恒定，我们需要：
 # λ = λ_ref · √(B/B_ref) · (D_ref/D)
-# Note that these papers study AdamW, *not* Muon. We are blindly following AdamW theory for scaling hoping it ~works for Muon too.
+# 注意这些论文研究的是 AdamW，*不是* Muon。我们盲目遵循 AdamW 的缩放理论，希望它对 Muon 也大致有效。
 weight_decay_scaled = args.weight_decay * math.sqrt(total_batch_size / B_REF) * (D_REF / target_tokens)
 if weight_decay_scaled != args.weight_decay:
     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
 # -----------------------------------------------------------------------------
-# Initialize the Optimizer (combined MuonAdamW: Muon for matrix params, AdamW for rest)
+# 初始化优化器（组合版 MuonAdamW：矩阵参数使用 Muon，其余参数使用 AdamW）
 optimizer = model.setup_optimizer(
-    # AdamW hyperparameters
+    # AdamW 超参数
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
+    # Muon 超参数
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
 )
 
+# 从检查点恢复
 if resuming:
     optimizer.load_state_dict(optimizer_data)
     del optimizer_data
 
 # -----------------------------------------------------------------------------
-# GradScaler for fp16 training (bf16/fp32 don't need it — bf16 has the same exponent range as fp32)
+# GradScaler 用于 fp16 训练（bf16/fp32 不需要 — bf16 与 fp32 具有相同的指数范围）
 scaler = torch.amp.GradScaler() if COMPUTE_DTYPE == torch.float16 else None
 if scaler is not None:
     print0("GradScaler enabled for fp16 training")
 
 # -----------------------------------------------------------------------------
-# Initialize the DataLoaders for train/val
+# 初始化训练/验证的数据加载器
 dataloader_resume_state_dict = None if not resuming else meta_data["dataloader_state_dict"]
 train_loader = tokenizing_distributed_data_loader_with_state_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="train", device=device, resume_state_dict=dataloader_resume_state_dict)
 build_val_loader = lambda: tokenizing_distributed_data_loader_bos_bestfit(tokenizer, args.device_batch_size, args.max_seq_len, split="val", device=device)
-x, y, dataloader_state_dict = next(train_loader) # kick off load of the very first batch of data
+x, y, dataloader_state_dict = next(train_loader) # 启动第一个数据批次的加载
 
 # -----------------------------------------------------------------------------
-# Calculate the number of iterations we will train for and set up the various schedulers
+# 计算我们将训练的迭代次数并设置各种调度器
 
-# num_iterations: either it is given, or from target flops, or from target data:param ratio (in that order)
+# num_iterations：要么由用户指定，要么来自目标 FLOPs，要么来自目标数据：参数比例（按此顺序）
 assert args.num_iterations > 0 or args.target_param_data_ratio > 0 or args.target_flops > 0
 if args.num_iterations > 0:
-    # Override num_iterations to a specific value if given
+    # 如果提供了 num_iterations，则覆盖为特定值
     num_iterations = args.num_iterations
     print0(f"Using user-provided number of iterations: {num_iterations:,}")
 elif args.target_flops > 0:
-    # Calculate the number of iterations from the target flops (used in scaling laws analysis, e.g. runs/scaling_laws.sh)
+    # 根据目标 FLOPs 计算迭代次数（用于缩放法则分析，例如 runs/scaling_laws.sh）
     num_iterations = round(args.target_flops / (num_flops_per_token * total_batch_size))
     print0(f"Calculated number of iterations from target FLOPs: {num_iterations:,}")
 elif args.target_param_data_ratio > 0:
-    # Calculate the number of iterations from the target param data ratio (the most common use case)
+    # 根据目标参数数据比例计算迭代次数（最常见的使用场景）
     num_iterations = target_tokens // total_batch_size
     print0(f"Calculated number of iterations from target data:param ratio: {num_iterations:,}")
 else:
     raise ValueError("No training horizon specified")
-total_tokens = total_batch_size * num_iterations # the actual number of tokens we will train for
+total_tokens = total_batch_size * num_iterations # 我们将实际训练的 token 总数
 print0(f"Total number of training tokens: {total_tokens:,}")
-print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # e.g. Chinchilla was ~20
+print0(f"Tokens : Scaling params ratio: {total_batch_size * num_iterations / num_scaling_params:.2f}") # 例如 Chinchilla 约为 20
 print0(f"Total training FLOPs estimate: {num_flops_per_token * total_tokens:e}")
 
-# Learning rate schedule (linear warmup, constant, linear warmdown)
+# 学习率调度（线性预热，恒定，线性衰减）
 def get_lr_multiplier(it):
+    """
+    根据迭代步数线性调整学习率乘子，1/warmup_iters -> 1 -> args.final_lr_frac
+
+    Args:
+        it:
+            训练步数
+    """
     warmup_iters = args.warmup_steps
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     if it < warmup_iters:
@@ -380,7 +392,7 @@ def get_lr_multiplier(it):
         progress = (num_iterations - it) / warmdown_iters
         return progress * 1.0 + (1 - progress) * args.final_lr_frac
 
-# Momentum scheduler for Muon optimizer (warms up to 0.97, warms down to 0.90 during LR warmdown)
+# Muon 优化器的动量调度（预热到 0.97，在学习率衰减期间衰减到 0.90）
 def get_muon_momentum(it):
     warmdown_iters = round(args.warmdown_ratio * num_iterations)
     warmdown_start = num_iterations - warmdown_iters
@@ -393,20 +405,20 @@ def get_muon_momentum(it):
     else:
         return 0.97
 
-# Weight decay scheduler for Muon optimizer (cosine decay to zero over the course of training)
+# Muon 优化器的权重衰减调度（在训练过程中余弦衰减到零）
 def get_weight_decay(it):
     return weight_decay_scaled * 0.5 * (1 + math.cos(math.pi * it / num_iterations))
 
 # -----------------------------------------------------------------------------
-# Training loop
+# 训练循环
 
-# Loop state (variables updated by the training loop)
+# 循环状态（由训练循环更新的变量）
 if not resuming:
     step = 0
-    val_bpb = None # will be set if eval_every > 0
+    val_bpb = None # 如果 eval_every > 0 则会被设置
     min_val_bpb = float("inf")
-    smooth_train_loss = 0 # EMA of training loss
-    total_training_time = 0 # total wall-clock time of training
+    smooth_train_loss = 0 # 训练损失的 EMA（指数移动平均）
+    total_training_time = 0 # 训练的总挂钟时间
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
@@ -415,23 +427,23 @@ else:
     smooth_train_loss = loop_state["smooth_train_loss"]
     total_training_time = loop_state["total_training_time"]
 
-# Figure out the needed gradient accumulation micro-steps to reach the desired total batch size per step
-tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # tokens per iteration for a single rank
-world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # total tokens per iteration for all ranks
+# 计算达到每步所需总批次大小所需的梯度累积微步数
+tokens_per_fwdbwd = args.device_batch_size * args.max_seq_len # 单个 rank 每次迭代的 token 数
+world_tokens_per_fwdbwd = tokens_per_fwdbwd * ddp_world_size # 所有 rank 每次迭代的总 token 数
 assert total_batch_size % world_tokens_per_fwdbwd == 0
 grad_accum_steps = total_batch_size // world_tokens_per_fwdbwd
 print0(f"Tokens / micro-batch / rank: {args.device_batch_size} x {args.max_seq_len} = {tokens_per_fwdbwd:,}")
 print0(f"Tokens / micro-batch: {world_tokens_per_fwdbwd:,}")
 print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {grad_accum_steps}")
 
-# Go!
+# 开始！
 while True:
-    last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
+    last_step = step == num_iterations # 循环运行 num_iterations+1 次，以便在结束时进行评估/保存
     flops_so_far = num_flops_per_token * total_batch_size * step
 
-    # once in a while: evaluate the val bpb (all ranks participate)
+    # 每eval_every步评估验证集的 bpb（所有 rank 参与）
     if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
-        model.eval()
+        model.eval()    # 调节 training 值，在验证中使用，和后面的 model.train() 对应
         val_loader = build_val_loader()
         eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
         with disable_fp8(model):
@@ -447,9 +459,9 @@ while True:
         })
         model.train()
 
-    # once in a while: estimate the CORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    # disable FP8 for evaluation to use BF16 for more consistent/accurate results
+    # 偶尔评估 CORE 指标（所有 rank 参与）
+    # 使用原始的未编译模型，因为输入形状在不断变化
+    # 在评估时禁用 FP8，以使用 BF16 获得更一致/准确的结果
     results = {}
     if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
         model.eval()
@@ -464,8 +476,8 @@ while True:
         })
         model.train()
 
-    # once in a while: sample from the model (only on master process)
-    # use the original uncompiled model because the inputs keep changing shape
+    # 偶尔从模型中采样（仅在主进程上执行）
+    # 使用原始的未编译模型，因为输入形状在不断变化
     if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
         model.eval()
         prompts = [
@@ -477,7 +489,7 @@ while True:
             "My favorite color is",
             "If 5*x + 3 = 13, then x is",
         ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+        engine = Engine(orig_model, tokenizer) # 使用 orig_model 以避免重新编译
         for prompt in prompts:
             tokens = tokenizer(prompt, prepend="<|bos|>")
             with disable_fp8(orig_model):
@@ -490,18 +502,18 @@ while True:
         save_checkpoint(
             checkpoint_dir,
             step,
-            orig_model.state_dict(), # model parameters
-            optimizer.state_dict(), # optimizer state
-            { # metadata saved as json
-                "step": step,
-                "val_bpb": val_bpb, # loss at last step
+            orig_model.state_dict(), # 模型参数
+            optimizer.state_dict(), # 优化器状态
+            { # 以 json 格式保存的元数据
+                "step": step, # 迭代步数
+                "val_bpb": val_bpb, # 最后一步的损失
                 "model_config": model_config_kwargs,
-                "user_config": user_config, # inputs to the training script
+                "user_config": user_config, # 用户训练脚本输入的参数
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "total_batch_size": total_batch_size,
-                "dataloader_state_dict": dataloader_state_dict,
-                "loop_state": { # all loop state (other than step) so that we can resume training
+                "dataloader_state_dict": dataloader_state_dict, # 数据加载器的状态
+                "loop_state": { # 所有循环状态（除 step 外），以便恢复训练
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "total_training_time": total_training_time,
@@ -510,25 +522,25 @@ while True:
             rank=ddp_rank,
         )
 
-    # termination conditions (TODO: possibly also add loss explosions etc.)
+    # 终止条件（TODO：可能还需添加损失爆炸等）
     if last_step:
         break
 
     # -------------------------------------------------------------------------
-    # single training step
-    # evaluate the gradient
+    # 单步训练
+    # 计算梯度
     synchronize()
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
-        loss = model(x, y)
-        train_loss = loss.detach() # for logging
-        loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
+        loss = model(x, y)  # 调用 forward 计算损失
+        train_loss = loss.detach() # 用于日志记录
+        loss = loss / grad_accum_steps # 每次 .backward() 是梯度求和 => 此处归一化损失
         if scaler is not None:
-            scaler.scale(loss).backward()
+            scaler.scale(loss).backward()   # 如果启用了 AMP
         else:
             loss.backward()
-        x, y, dataloader_state_dict = next(train_loader) # prefetch the next batch while the GPU is busy with forward/backward
-    # step the optimizer
+        x, y, dataloader_state_dict = next(train_loader) # 在 GPU 忙于前向/反向时预取下一批数据
+    # 优化器参数动态调整
     lrm = get_lr_multiplier(step)
     muon_momentum = get_muon_momentum(step)
     muon_weight_decay = get_weight_decay(step)
@@ -539,9 +551,9 @@ while True:
             group["weight_decay"] = muon_weight_decay
     if scaler is not None:
         scaler.unscale_(optimizer)
-        # In distributed training, all ranks must agree on whether to skip the step.
-        # Each rank may independently encounter inf/nan gradients, so we all-reduce
-        # the found_inf flag (MAX = if any rank found inf, all ranks skip).
+        # 在分布式训练中，所有 rank 必须就是否跳过该步骤达成一致。
+        # 每个 rank 可能独立遇到 inf/nan 梯度，因此我们对 found_inf 标志进行 all-reduce
+        # （取最大值 = 如果任何 rank 发现 inf，所有 rank 都跳过）。
         if is_ddp_initialized():
             for v in scaler._found_inf_per_device(optimizer).values():
                 dist.all_reduce(v, op=dist.ReduceOp.MAX)
@@ -550,23 +562,23 @@ while True:
     else:
         optimizer.step()
     model.zero_grad(set_to_none=True)
-    train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
+    train_loss_f = train_loss.item() # .item() 是 CPU-GPU 同步点
     synchronize()
     t1 = time.time()
     dt = t1 - t0
     # -------------------------------------------------------------------------
 
-    # logging (CPU action only)
-    ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    # 日志 (只有 CPU 动作)
+    ema_beta = 0.9 # EMA 衰减因子，用于平滑处理，仅为了更美观的日志记录
+    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # 对训练损失进行 EMA 平滑
+    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # 对 EMA 进行去偏校正
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(total_batch_size / dt)
     flops_per_sec = num_flops_per_token * total_batch_size / dt
     mfu = 100 * flops_per_sec / (gpu_peak_flops * ddp_world_size)
     if step > 10:
-        total_training_time += dt # only count the time after the first 10 steps
-    # Calculate ETA based on average time per step (excluding first 10 steps)
+        total_training_time += dt # 仅统计前 10 步之后的时间
+    # 根据平均每步时间计算预计剩余时间（排除前 10 步）
     steps_done = step - 10
     if steps_done > 0:
         avg_time_per_step = total_training_time / steps_done
@@ -591,31 +603,31 @@ while True:
         }
         wandb_run.log(log_data)
 
-    # state update
+    # 状态更新
     first_step_of_run = (step == 0) or (resuming and step == args.resume_from_step)
     step += 1
 
-    # The garbage collector is sadly a little bit overactive and for some poorly understood reason,
-    # it spends ~500ms scanning for cycles quite frequently, just to end up cleaning up very few tiny objects each time.
-    # So we manually manage and help it out here
+    # 垃圾回收器有点过于活跃，并且由于一些不太清楚的原因，
+    # 它会相当频繁地花费约500ms扫描循环引用，结果每次只清理很少的几个小对象。
+    # 所以我们在这里手动管理并帮助它
     if first_step_of_run:
-        gc.collect() # manually collect a lot of garbage from setup
-        gc.freeze() # immediately freeze all currently surviving objects and exclude them from GC
-        gc.disable() # nuclear intervention here: disable GC entirely except:
-    elif step % 5000 == 0: # every 5000 steps...
-        gc.collect() # manually collect, just to be safe for very, very long runs
+        gc.collect() # 手动收集初始化阶段产生的大量垃圾
+        gc.freeze() # 立即冻结当前所有存活对象，并将它们排除在GC之外
+        gc.disable() # 核弹级干预：完全禁用GC，但以下情况除外：
+    elif step % 5000 == 0: # 每5000步...
+        gc.collect() # 手动收集，只是为了在非常非常长的运行中保持安全
 
-# print a few more stats
+# 打印一些状态
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
 if val_bpb is not None:
     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
 
-# Log to report
+# 记录报告
 from nanochat.report import get_report
 get_report().log(section="Base model training", data=[
-    user_config, # CLI args
-    { # stats about the training setup
+    user_config, # 用户参数
+    { # 训练启动的参数
         "Number of parameters": num_params,
         "Number of FLOPs per token": f"{num_flops_per_token:e}",
         "Calculated number of iterations": num_iterations,
@@ -626,7 +638,7 @@ get_report().log(section="Base model training", data=[
         "warmdown_ratio": args.warmdown_ratio,
         "final_lr_frac": args.final_lr_frac,
     },
-    { # stats about training outcomes
+    { # 训练结果状态
         "Minimum validation bpb": min_val_bpb if val_bpb is not None else None,
         "Final validation bpb": val_bpb,
         "CORE metric estimate": results.get("core_metric", None),
@@ -637,6 +649,6 @@ get_report().log(section="Base model training", data=[
     }
 ])
 
-# cleanup
-wandb_run.finish() # wandb run finish
+# 清理
+wandb_run.finish() # wandb 运行结束
 compute_cleanup()
